@@ -6,7 +6,6 @@ blueprint:
       • HVAC mode decision (auto ↔︎ off) based on override, schedule, and/or presence
     No more copy-pasting three nearly-identical automations per room.
   domain: automation
-  version: 1
 
   input:
     climate_entity:
