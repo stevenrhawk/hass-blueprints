@@ -1,0 +1,166 @@
+blueprint:
+  name: Room – HVAC Override & Mode (single-file, multi-flow)
+  description: |
+    Handles every room’s:
+      • Timed override (start / refresh via input_select, clear on timer.finished)
+      • HVAC mode decision (auto ↔︎ off) based on override, schedule, and/or presence
+    No more copy-pasting three nearly-identical automations per room.
+  domain: automation
+  version: 1
+
+  input:
+    climate_entity:
+      name: Climate entity
+      selector:
+        entity:
+          domain: climate
+
+    override_timer:
+      name: Override timer
+      selector:
+        entity:
+          domain: timer
+
+    override_select:
+      name: Override duration select
+      selector:
+        entity:
+          domain: input_select
+
+    override_boolean:
+      name: Override active boolean
+      selector:
+        entity:
+          domain: input_boolean
+
+    # --- OCCUPANCY LOGIC ----------------------------------------------
+    schedule:
+      name: Schedule entity  (leave blank if none)
+      default: ""
+      selector:
+        entity: {}
+
+    presence_entities:
+      name: Entities that mean “someone’s here”
+      description: >
+        Any mix of person.* trackers, binary_sensors, lights, etc.
+        If **any** of these is ‘home’/‘on’, the room counts as occupied.
+        Leave empty if you rely on schedule-only logic.
+      default: []
+      selector:
+        entity:
+          multiple: true
+
+    presence_true_states:
+      name: States that count as “present”
+      description: >
+        Advanced: change only if your presence_entities don’t follow the usual
+        Home (for persons) / On (for lights, sensors) convention.
+      default: "home,on"
+      selector:
+        text:
+
+    # Value to reset the select to when the timer ends (usually “0”)
+    reset_option:
+      name: Reset option text
+      default: "0"
+      selector:
+        text:
+
+# ---------------------------- TRIGGERS ---------------------------------
+trigger:
+  # A) Override timer finished → clear override
+  - id: timer_finished
+    platform: event
+    event_type: timer.finished
+    event_data:
+      entity_id: !input override_timer
+
+  # B) Override select changed → maybe start / refresh timer
+  - id: override_select_changed
+    platform: state
+    entity_id: !input override_select
+
+  # C) Anything that could change occupancy
+  - id: hvac_recalc_override
+    platform: state
+    entity_id: !input override_boolean
+
+  - id: hvac_recalc_schedule
+    platform: state
+    entity_id: !input schedule
+    enabled: "{{ not (input.schedule | string) == '' }}"
+
+  - id: hvac_recalc_presence
+    platform: state
+    entity_id: !input presence_entities
+    enabled: "{{ (input.presence_entities | length) > 0 }}"
+
+# --------------------------- VARIABLES ---------------------------------
+variables:
+  ov_bool: !input override_boolean               # entity_id string
+  sched: !input schedule                         # may be ""
+  present_list: !input presence_entities         # list of entity_ids
+  present_states: "{{ !input presence_true_states.split(',') | map('trim') | list }}"
+
+  # Is anyone “here” according to presence_entities?
+  anyone_present: >
+    {% set here = false %}
+    {% for ent in present_list %}
+      {% if states(ent) in present_states %}
+        {% set here = true %}
+      {% endif %}
+    {% endfor %}
+    {{ here }}
+
+  schedule_on: "{{ sched and is_state(sched, 'on') }}"
+
+# --------------------------- ACTIONS -----------------------------------
+action:
+  - choose:
+
+      # 1️⃣  Timer finished → clear override
+      - conditions: "{{ trigger.id == 'timer_finished' }}"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input override_boolean
+          - service: input_select.select_option
+            target:
+              entity_id: !input override_select
+            data:
+              option: !input reset_option
+
+      # 2️⃣  Override selector picked a duration (>0) → start / refresh timer
+      - conditions: >
+          {{ trigger.id == 'override_select_changed'
+             and (trigger.to_state.state | int(0)) > 0 }}
+        sequence:
+          - service: timer.start
+            target:
+              entity_id: !input override_timer
+            data:
+              duration: "{{ (trigger.to_state.state | int) * 60 }}"
+          - service: input_boolean.turn_on
+            target:
+              entity_id: !input override_boolean
+
+  # 3️⃣  (Re-)Evaluate HVAC mode after *any* trigger
+  - service: climate.set_hvac_mode
+    target:
+      entity_id: !input climate_entity
+    data:
+      hvac_mode: >
+        {% if is_state(ov_bool, 'on') %}
+          auto
+        {% elif sched and present_list | length > 0 %}
+          {% if schedule_on and anyone_present %}auto{% else %}off{% endif %}
+        {% elif sched and present_list | length == 0 %}
+          {% if schedule_on %}auto{% else %}off{% endif %}
+        {% elif not sched %}
+          {% if anyone_present %}auto{% else %}off{% endif %}
+        {% else %}
+          off
+        {% endif %}
+
+mode: restart
